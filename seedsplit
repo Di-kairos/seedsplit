@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# seedsplit — распределить секрет на доли (Shamir Secret Sharing), экосистема Paranoid Tools.
+#
+# Разбить seed/пароль/ключ на N долей так, что любые T из них восстанавливают секрет,
+# а T-1 долей не дают о нём НИЧЕГО (порог Шамира). Чтобы один носитель/бэкап не был
+# единой точкой отказа и компрометации.
+#
+# ЧЕСТНО (тут особенно легко скатиться в снейкойл — НЕ обещаем больше, чем делаем):
+#   - качество долей = качество ГСЧ: берём /dev/urandom, не самопал;
+#   - секрет в argv виден в `ps` — ввод только через stdin/файл, не аргументом;
+#   - доли безопасны ровно настолько, насколько безопасно ты их ХРАНИШЬ и РАЗНОСИШЬ;
+#     порог защищает от утечки <T долей, но не от потери ≥(N-T+1) долей;
+#   - совместимости со SLIP-39 / аппаратными кошельками ПОКА НЕТ (1024-словарь + RS1024 +
+#     шифрование — это отдельное решение по объёму, не «ноль зависимостей»); решаем в паке.
+# Ядро split/combine над GF(256) реализовано (pack 2). См. README «Scope & limitations».
+set -euo pipefail
+
+VERSION="0.2.0"
+
+# === BEGIN vendored common (pin: 2e3d2dd5b36251bdcb1a8ffd348b63ece5fa7aab) ===
+# shellcheck shell=bash
+# common.sh — переиспользуемые примитивы экосистемы Paranoid Tools.
+#
+# Канонический источник: securetrash/lib/common.sh. Инструменты экосистемы
+# (vaultwatch/panic/ghostdraft) вендорят его inline между маркерами
+# (см. CLAUDE.md «Vendoring»). Файл sourceable и идемпотентен (двойной source/inline
+# безопасны — guard через if-обёртку, без top-level return, поэтому корректен и когда
+# блок вставлен в исполняемый скрипт).
+#
+# Даёт tool-агностичные примитивы: локаль (ST_LOCALE), цветной вывод (info/warn/err),
+# подтверждение (confirm), детект платформы macOS (require_macos/is_ssd/_disk_kind/
+# filevault_on), канонизацию пути (_abspath). Своя i18n-таблица — у каждого инструмента.
+#
+# ВЕНДОРИНГ — зарезервированные имена (не переопределять в host-скрипте): функции
+# info warn err confirm require_macos is_ssd _disk_kind filevault_on _abspath
+# _st_detect_locale; переменные ST_LOCALE C_RED C_GRN C_YEL C_RST _ST_COMMON_LOADED.
+
+# Идемпотентность через if-обёртку (а не top-level return): безопасно при source,
+# исполнении и inline-вставке. Определения функций внутри if регистрируются глобально.
+if [[ -z "${_ST_COMMON_LOADED:-}" ]]; then
+  _ST_COMMON_LOADED=1
+
+  # --- locale ---
+  # en по умолчанию; ru — если ST_LANG или системная локаль начинаются с 'ru'.
+  _st_detect_locale() {
+    local want="${ST_LANG:-}"
+    if [[ -n "$want" ]]; then
+      case "$want" in ru*) echo ru ;; *) echo en ;; esac
+      return
+    fi
+    local sys="${LC_ALL:-${LANG:-}}"
+    case "$sys" in ru*) echo ru ;; *) echo en ;; esac
+  }
+  # Уважаем заранее выставленный ST_LOCALE (host может переопределить).
+  ST_LOCALE="${ST_LOCALE:-$(_st_detect_locale)}"
+
+  # --- output ---
+  # Цвет только в TTY (в пайпах/файлах — без ANSI).
+  if [[ -t 1 ]]; then
+    C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'; C_RST=$'\033[0m'
+  else
+    C_RED=""; C_GRN=""; C_YEL=""; C_RST=""
+  fi
+  info() { echo "${C_GRN}✓${C_RST} $*"; }
+  warn() { echo "${C_YEL}!${C_RST} $*" >&2; }
+  err()  { echo "${C_RED}✗${C_RST} $*" >&2; }
+
+  # --- confirm ---
+  # Подтверждение необратимой операции. ST_ASSUME_YES=1 обходит вопрос (скрипты/тесты).
+  # Возвращает 0 только при точном вводе 'yes' (EOF/пусто → отказ, fail-closed).
+  # Суффикс намеренно продублирован из i18n securetrash (lib без таблицы строк).
+  confirm() {
+    local prompt="$1" ans suffix
+    [[ "${ST_ASSUME_YES:-0}" == "1" ]] && return 0
+    case "$ST_LOCALE" in ru) suffix="[введите yes]" ;; *) suffix="[type yes]" ;; esac
+    read -r -p "$prompt $suffix: " ans
+    [[ "$ans" == "yes" ]]
+  }
+
+  # --- platform (macOS) ---
+  require_macos() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+      case "$ST_LOCALE" in
+        ru) err "работает только на macOS." ;;
+        *)  err "runs on macOS only." ;;
+      esac
+      exit 1
+    fi
+  }
+
+  # Диск под путём — SSD? (diskutil info: "Solid State: Yes")
+  is_ssd() {
+    local path="${1:-/}"
+    diskutil info "$path" 2>/dev/null | grep -qi "Solid State:.*Yes"
+  }
+
+  # Тип диска: ssd | hdd | unknown. Честность важнее догадок: неизвестный тип
+  # НЕ приравниваем к hdd-эффективному (нет поля "Solid State" → unknown).
+  _disk_kind() {
+    local path="${1:-/}" out
+    out="$(diskutil info "$path" 2>/dev/null)"
+    if grep -qi "Solid State:.*Yes" <<<"$out"; then echo ssd
+    elif grep -qi "Solid State:.*No" <<<"$out"; then echo hdd
+    else echo unknown; fi
+  }
+
+  # FileVault включён? (fdesetup status: "FileVault is On.")
+  filevault_on() {
+    fdesetup status 2>/dev/null | grep -qi "FileVault is On"
+  }
+
+  # --- path ---
+  # Физический канонический путь: режет trailing-slash, резолвит .. и симлинки,
+  # ВКЛЮЧАЯ финальный компонент. Непустая строка или код !=0, если путь недоступен.
+  _abspath() {
+    local p="$1"
+    while [[ "$p" == */ && "$p" != "/" ]]; do p="${p%/}"; done
+    if [[ -d "$p" ]]; then
+      ( cd -P -- "$p" 2>/dev/null && pwd -P ); return
+    fi
+    local d b
+    d="$(cd -P -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)" || return 1
+    b="$(basename -- "$p")"
+    printf '%s/%s' "${d%/}" "$b"
+  }
+fi
+# === END vendored common ===
+
+# --- i18n (таблица строк seedsplit; общие примитивы — в vendored common) ---
+t() {
+  local key="$1"; shift
+  case "$ST_LOCALE:$key" in
+    en:usage)
+      cat <<'EOF'
+Usage: seedsplit <command> [args]
+
+Commands:
+  split [-n N] [-t T] [--file F]   Split a secret (from stdin or --file) into N
+                                   shares; any T reconstruct it. Default: -n 3 -t 2.
+  combine [FILE...]                Reconstruct the secret from >=T shares
+                                   (read from stdin, one per line, or from FILEs).
+  version                          Show the version
+
+Secret is read from stdin/--file, NEVER argv (argv is visible in `ps`).
+seedsplit does NOT yet interoperate with SLIP-39 / hardware wallets — that is a
+scope decision for a later pack. Shares are only as safe as where you store them.
+EOF
+      ;;
+    ru:usage)
+      cat <<'EOF'
+Usage: seedsplit <command> [args]
+
+Commands:
+  split [-n N] [-t T] [--file F]   Разбить секрет (из stdin или --file) на N долей;
+                                   любые T восстанавливают его. По умолчанию: -n 3 -t 2.
+  combine [FILE...]                Восстановить секрет из >=T долей
+                                   (читает из stdin по строке на долю, либо из FILE).
+  version                          Показать версию
+
+Секрет читается из stdin/--file, НИКОГДА из argv (argv виден в `ps`).
+seedsplit ПОКА не совместим со SLIP-39 / аппаратными кошельками — это решение по
+объёму на будущий пак. Доли безопасны ровно настолько, насколько безопасно ты их хранишь.
+EOF
+      ;;
+    en:unknown_cmd) printf 'Unknown command: %s' "$1" ;;
+    ru:unknown_cmd) printf 'Unknown command: %s' "$1" ;;
+    *) echo "$key" ;;
+  esac
+}
+
+usage() { t usage; }
+
+cmd_version() { echo "seedsplit $VERSION"; }
+
+# === Shamir Secret Sharing над GF(256) (pack 2) ===
+# Поле GF(2^8), редуцирующий многочлен 0x11b (как в AES). Сложение = XOR.
+# Умножение — через таблицы log/antilog от генератора 0x03 (примитивный элемент поля).
+# Деление/инверсия — через те же таблицы. Все операции — над байтами секрета.
+
+# sha256 → hex (портативно: macOS shasum / Linux sha256sum). Для контрольных сумм.
+_sha256_hex() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+  else sha256sum | cut -d' ' -f1; fi
+}
+# bytes(stdin) → hex без пробелов; hex(arg) → raw bytes(stdout). Без xxd (нет на части систем).
+_to_hex() { od -An -v -tx1 | tr -d ' \n'; }
+_from_hex() { local h="$1" i; for ((i=0; i<${#h}; i+=2)); do printf '%b' "\\x${h:i:2}"; done; }
+
+# Таблицы GF(256): GF_EXP[i]=g^i (g=3), GF_LOG[v]=i. Генерируются один раз.
+_gf_init() {
+  local x=1 i tt
+  GF_EXP=(); GF_LOG=()
+  for ((i=0; i<255; i++)); do
+    GF_EXP[i]=$x
+    GF_LOG[x]=$i
+    tt=$(( (x<<1) & 0xff ))                 # xtime(x) = x*2 в GF
+    if (( x & 0x80 )); then tt=$(( tt ^ 0x1b )); fi
+    x=$(( tt ^ x ))                          # x*3 = xtime(x) XOR x
+  done
+}
+
+cmd_split() {
+  require_macos
+  local n=3 t=2 file=""
+  while (( $# )); do
+    case "$1" in
+      -n|--shares)    n="${2:?}"; shift 2 ;;
+      -t|--threshold) t="${2:?}"; shift 2 ;;
+      --file)         file="${2:?}"; shift 2 ;;
+      *) err "split: неизвестный аргумент: $1"; exit 1 ;;
+    esac
+  done
+
+  # Секрет — из stdin или --file, в hex. Никогда из argv (виден в `ps`).
+  local secret_hex
+  if [[ -n "$file" ]]; then
+    [[ -r "$file" ]] || { err "split: файл недоступен: $file"; exit 1; }
+    secret_hex="$(_to_hex < "$file")"
+  else
+    secret_hex="$(_to_hex)"
+  fi
+  [[ -n "$secret_hex" ]] || { err "split: пустой секрет (подай через stdin или --file)"; exit 1; }
+
+  [[ "$n" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ ]] || { err "split: -n/-t должны быть числами"; exit 1; }
+  (( t >= 2 )) || { err "split: порог -t должен быть ≥2 (иначе доля = весь секрет)"; exit 1; }
+  (( n >= t )) || { err "split: число долей -n ($n) должно быть ≥ порога -t ($t)"; exit 1; }
+  (( n <= 255 )) || { err "split: -n не может превышать 255 (точки оценки GF(256))"; exit 1; }
+
+  local L=$(( ${#secret_hex} / 2 ))
+  (( L <= 65535 )) || { err "split: секрет слишком большой (>65535 байт)"; exit 1; }
+
+  # Обёртка целостности: 0x55 | len(2B BE) | secret | crc(2B = первые 2 байта sha256 предыдущего).
+  # Даёт combine возможность вернуть ЛИБО точный секрет, ЛИБО честный отказ (порча/чужой набор).
+  local hi=$(( L >> 8 )) lo=$(( L & 0xff )) core_hex crc_hex
+  printf -v core_hex '55%02x%02x%s' "$hi" "$lo" "$secret_hex"
+  crc_hex="$(_from_hex "$core_hex" | _sha256_hex)"; crc_hex="${crc_hex:0:4}"
+  local payload_hex="${core_hex}${crc_hex}" PL
+  PL=$(( ${#payload_hex} / 2 ))
+
+  local -a P=(); local k
+  for ((k=0; k<PL; k++)); do P[k]=$(( 16#${payload_hex:k*2:2} )); done
+
+  _gf_init
+
+  # (t-1) случайных байт на каждый байт payload — старшие коэффициенты многочленов.
+  local need=$(( (t-1) * PL )) rand_hex
+  rand_hex="$(head -c "$need" /dev/urandom | _to_hex)"
+  [[ ${#rand_hex} -eq $((need*2)) ]] || { err "split: мало энтропии из /dev/urandom"; exit 1; }
+
+  local -a Y=(); local x j ri=0 y hb
+  for ((x=1; x<=n; x++)); do Y[x]=""; done
+  for ((k=0; k<PL; k++)); do
+    # Многочлен байта k: c0=P[k] (секрет), c1..c_{t-1} = случайные. Оцениваем в x=1..n (Горнер).
+    local -a C=(); C[0]=${P[k]}
+    for ((j=1; j<t; j++)); do C[j]=$(( 16#${rand_hex:ri*2:2} )); ri=$((ri+1)); done
+    for ((x=1; x<=n; x++)); do
+      y=${C[t-1]}
+      for ((j=t-2; j>=0; j--)); do
+        if (( y != 0 )); then y=${GF_EXP[$(( (GF_LOG[y]+GF_LOG[x]) % 255 ))]}; fi
+        y=$(( y ^ C[j] ))
+      done
+      printf -v hb '%02x' "$y"; Y[x]+="$hb"
+    done
+  done
+
+  # Доля: SSS1-<T>-<x>-<hexY>-<chk4>. chk ловит опечатку в этой конкретной доле.
+  for ((x=1; x<=n; x++)); do
+    local body="SSS1-${t}-${x}-${Y[x]}" chk
+    chk="$(printf '%s' "$body" | _sha256_hex)"; chk="${chk:0:4}"
+    printf '%s-%s\n' "$body" "$chk"
+  done
+}
+
+cmd_combine() {
+  require_macos
+  local raw
+  if (( $# )); then raw="$(cat "$@")"; else raw="$(cat)"; fi
+
+  _gf_init
+  local -a XS=() YS=()
+  local line ylen="" t_decl="" cnt=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ ! "$line" =~ ^SSS1-([0-9]+)-([0-9]+)-([0-9a-f]+)-([0-9a-f]{4})$ ]]; then
+      err "combine: строка не похожа на долю SSS1: $line"; exit 1
+    fi
+    local T="${BASH_REMATCH[1]}" x="${BASH_REMATCH[2]}" yh="${BASH_REMATCH[3]}" chk="${BASH_REMATCH[4]}"
+    local body="SSS1-${T}-${x}-${yh}" want
+    want="$(printf '%s' "$body" | _sha256_hex)"; want="${want:0:4}"
+    [[ "$chk" == "$want" ]] || { err "combine: доля повреждена (контрольная сумма не сошлась): x=$x"; exit 1; }
+    (( x >= 1 && x <= 255 )) || { err "combine: недопустимый номер доли x=$x"; exit 1; }
+    local d; for d in "${XS[@]:-}"; do [[ "$d" == "$x" ]] && { err "combine: повторяющаяся доля x=$x"; exit 1; }; done
+    [[ -z "$ylen" ]] && ylen="${#yh}"
+    [[ "${#yh}" -eq "$ylen" ]] || { err "combine: доли разной длины — набор несовместим"; exit 1; }
+    t_decl="$T"; XS+=("$x"); YS+=("$yh"); cnt=$((cnt+1))
+  done <<< "$raw"
+
+  (( cnt >= 1 )) || { err "combine: не подано ни одной доли"; exit 1; }
+  if [[ -n "$t_decl" ]] && (( cnt < t_decl )); then
+    err "combine: нужно минимум $t_decl долей, подано $cnt"; exit 1
+  fi
+
+  # Веса Лагранжа в нуле (одинаковы для всех байтов): w_i = prod_{j!=i} x_j * inv(x_i XOR x_j).
+  local m=$cnt i j
+  local -a W=()
+  for ((i=0; i<m; i++)); do
+    local num=1 xi="${XS[i]}"
+    for ((j=0; j<m; j++)); do
+      (( j == i )) && continue
+      local xj="${XS[j]}"; local den=$(( xi ^ xj ))
+      (( den != 0 )) || { err "combine: совпадающие точки долей"; exit 1; }
+      num=${GF_EXP[$(( (GF_LOG[num]+GF_LOG[xj]) % 255 ))]}                 # num *= x_j
+      num=${GF_EXP[$(( (GF_LOG[num]+(255-GF_LOG[den])%255) % 255 ))]}      # num *= inv(den)
+    done
+    W[i]=$num
+  done
+
+  # Восстановление каждого байта payload: acc = XOR_i ( y_i[p] * w_i ).
+  local PL=$(( ylen / 2 )) p payload_hex="" acc yb term hb
+  for ((p=0; p<PL; p++)); do
+    acc=0
+    for ((i=0; i<m; i++)); do
+      yb=$(( 16#${YS[i]:p*2:2} ))
+      if (( yb != 0 )); then
+        term=${GF_EXP[$(( (GF_LOG[yb]+GF_LOG[W[i]]) % 255 ))]}
+        acc=$(( acc ^ term ))
+      fi
+    done
+    printf -v hb '%02x' "$acc"; payload_hex+="$hb"
+  done
+
+  # Проверка обёртки: либо точный секрет, либо честный отказ.
+  local bad="combine: набор не образует валидный секрет (доли повреждены или от разных секретов)"
+  (( PL >= 6 )) || { err "$bad"; exit 1; }
+  (( 16#${payload_hex:0:2} == 0x55 )) || { err "$bad"; exit 1; }
+  local len=$(( 16#${payload_hex:2:4} ))
+  (( PL == len + 5 )) || { err "$bad"; exit 1; }
+  local core_hex="${payload_hex:0:$(( (len+3)*2 ))}" crc_have="${payload_hex: -4}" crc_want
+  crc_want="$(_from_hex "$core_hex" | _sha256_hex)"; crc_want="${crc_want:0:4}"
+  [[ "$crc_have" == "$crc_want" ]] || { err "$bad"; exit 1; }
+
+  _from_hex "${payload_hex:6:$(( len*2 ))}"
+}
+
+main() {
+  local cmd="${1:-}"
+  if [[ -z "$cmd" ]]; then usage; exit 1; fi
+  shift || true
+  case "$cmd" in
+    version)        cmd_version "$@" ;;
+    help|--help|-h) usage ;;
+    split)          cmd_split "$@" ;;
+    combine)        cmd_combine "$@" ;;
+    *) t unknown_cmd "$cmd" >&2; echo >&2; usage >&2; exit 1 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
