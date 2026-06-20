@@ -26,6 +26,11 @@ setup() {
   [[ "$output" == *"Usage:"* ]]
 }
 
+@test "--version flag prints version" { run bash "$SCRIPT" --version; [ "$status" -eq 0 ]; [[ "$output" == *"seedsplit"* ]]; }
+@test "-v flag prints version" { run bash "$SCRIPT" -v; [ "$status" -eq 0 ]; [[ "$output" == *"seedsplit"* ]]; }
+@test "--help flag prints usage" { run bash "$SCRIPT" --help; [ "$status" -eq 0 ]; [[ "$output" == *"Usage:"* ]]; }
+@test "-h flag prints usage" { run bash "$SCRIPT" -h; [ "$status" -eq 0 ]; [[ "$output" == *"Usage:"* ]]; }
+
 @test "unknown command exits non-zero" {
   run bash "$SCRIPT" bogus
   [ "$status" -ne 0 ]
