@@ -15,7 +15,7 @@
 # Ядро split/combine над GF(256) реализовано (pack 2). См. README «Scope & limitations».
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # === BEGIN vendored common (pin: 2e3d2dd5b36251bdcb1a8ffd348b63ece5fa7aab) ===
 # shellcheck shell=bash
@@ -139,6 +139,7 @@ Commands:
                                    shares; any T reconstruct it. Default: -n 3 -t 2.
   combine [FILE...]                Reconstruct the secret from >=T shares
                                    (read from stdin, one per line, or from FILEs).
+  verify  [FILE...]                Check that >=T shares reconstruct WITHOUT printing the secret.
   version                          Show the version
 
 Secret is read from stdin/--file, NEVER argv (argv is visible in `ps`).
@@ -155,6 +156,7 @@ Commands:
                                    любые T восстанавливают его. По умолчанию: -n 3 -t 2.
   combine [FILE...]                Восстановить секрет из >=T долей
                                    (читает из stdin по строке на долю, либо из FILE).
+  verify  [FILE...]                Проверить восстановимость из >=T долей БЕЗ печати секрета.
   version                          Показать версию
 
 Секрет читается из stdin/--file, НИКОГДА из argv (argv виден в `ps`).
@@ -172,10 +174,13 @@ usage() { t usage; }
 
 cmd_version() { echo "seedsplit $VERSION"; }
 
-# === Shamir Secret Sharing над GF(256) (pack 2) ===
+# === Shamir Secret Sharing над GF(256) ===
 # Поле GF(2^8), редуцирующий многочлен 0x11b (как в AES). Сложение = XOR.
 # Умножение — через таблицы log/antilog от генератора 0x03 (примитивный элемент поля).
 # Деление/инверсия — через те же таблицы. Все операции — над байтами секрета.
+# ПРЕДЕЛ (честно, см. README «Scope & limitations»): умножение через log/antilog-таблицы
+# НЕ constant-time — есть тайминговый side-channel. Вне модели угроз локального CLI
+# (нет удалённого/онлайн-оракула на split/combine), но мы его не скрываем.
 
 # sha256 → hex (портативно: macOS shasum / Linux sha256sum). Для контрольных сумм.
 _sha256_hex() {
@@ -229,12 +234,21 @@ cmd_split() {
   local L=$(( ${#secret_hex} / 2 ))
   (( L <= 65535 )) || { err "split: секрет слишком большой (>65535 байт)"; exit 1; }
 
-  # Обёртка целостности: 0x55 | len(2B BE) | secret | crc(2B = первые 2 байта sha256 предыдущего).
-  # Даёт combine возможность вернуть ЛИБО точный секрет, ЛИБО честный отказ (порча/чужой набор).
-  local hi=$(( L >> 8 )) lo=$(( L & 0xff )) core_hex crc_hex
+  # Случайный set-id (4-байтный nonce) — НЕ производный от секрета (иначе confirmation-оракул:
+  # имея одну долю + кандидат-секрет, можно было бы проверить догадку, не собирая порог).
+  # Одинаков во всех долях набора → combine ДЕТЕРМИНИРОВАННО отвергает смешивание долей
+  # из разных сплитов (а не вероятностно).
+  local setid_hex
+  setid_hex="$(head -c 4 /dev/urandom | _to_hex)"
+  [[ ${#setid_hex} -eq 8 ]] || { err "split: мало энтропии из /dev/urandom"; exit 1; }
+
+  # Обёртка целостности: 0x55 | len(2B BE) | secret | tag(16B = первые 16 байт sha256 предыдущего).
+  # 128-битный tag: combine вернёт ЛИБО точный секрет, ЛИБО честный отказ; шанс молча отдать
+  # НЕ тот секрет ≈ 2^-128 (против 2^-16 у старого 2-байтного CRC).
+  local hi=$(( L >> 8 )) lo=$(( L & 0xff )) core_hex tag_hex
   printf -v core_hex '55%02x%02x%s' "$hi" "$lo" "$secret_hex"
-  crc_hex="$(_from_hex "$core_hex" | _sha256_hex)"; crc_hex="${crc_hex:0:4}"
-  local payload_hex="${core_hex}${crc_hex}" PL
+  tag_hex="$(_from_hex "$core_hex" | _sha256_hex)"; tag_hex="${tag_hex:0:32}"
+  local payload_hex="${core_hex}${tag_hex}" PL
   PL=$(( ${#payload_hex} / 2 ))
 
   local -a P=(); local k
@@ -263,41 +277,54 @@ cmd_split() {
     done
   done
 
-  # Доля: SSS1-<T>-<x>-<hexY>-<chk4>. chk ловит опечатку в этой конкретной доле.
+  # Доля: SSS2-<setid>-<T>-<x>-<hexY>-<chk4>. chk ловит опечатку в конкретной доле;
+  # setid — смешивание долей из разных сплитов. Формат SSS2 НЕсовместим со старым SSS1.
   for ((x=1; x<=n; x++)); do
-    local body="SSS1-${t}-${x}-${Y[x]}" chk
+    local body="SSS2-${setid_hex}-${t}-${x}-${Y[x]}" chk
     chk="$(printf '%s' "$body" | _sha256_hex)"; chk="${chk:0:4}"
     printf '%s-%s\n' "$body" "$chk"
   done
 }
 
-cmd_combine() {
-  require_macos
-  local raw
-  if (( $# )); then raw="$(cat "$@")"; else raw="$(cat)"; fi
-
+# Восстановление секрета из долей: парсинг + ВСЕ проверки + интерполяция Лагранжа в нуле.
+# Печатает secret_hex в stdout при успехе; при ЛЮБОЙ ошибке — сообщение в stderr и `return !=0`
+# (НЕ exit: функция зовётся в $(...), exit убил бы только subshell и оставил вызывающего без
+# проверки статуса). Таксономия ошибок различает: не-SSS2 / порча доли (CRC) / разные сплиты
+# (set-id) / расходящийся порог T / ниже порога / провал целостности payload.
+_recover_secret_hex() {
+  local raw="$1"
   _gf_init
   local -a XS=() YS=()
-  local line ylen="" t_decl="" cnt=0
+  local line ylen="" t_decl="" setid_seen="" cnt=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    if [[ ! "$line" =~ ^SSS1-([0-9]+)-([0-9]+)-([0-9a-f]+)-([0-9a-f]{4})$ ]]; then
-      err "combine: строка не похожа на долю SSS1: $line"; exit 1
+    if [[ ! "$line" =~ ^SSS2-([0-9a-f]{8})-([0-9]+)-([0-9]+)-([0-9a-f]+)-([0-9a-f]{4})$ ]]; then
+      err "combine: строка не похожа на долю формата SSS2: $line"; return 1
     fi
-    local T="${BASH_REMATCH[1]}" x="${BASH_REMATCH[2]}" yh="${BASH_REMATCH[3]}" chk="${BASH_REMATCH[4]}"
-    local body="SSS1-${T}-${x}-${yh}" want
+    local sid="${BASH_REMATCH[1]}" T="${BASH_REMATCH[2]}" x="${BASH_REMATCH[3]}" yh="${BASH_REMATCH[4]}" chk="${BASH_REMATCH[5]}"
+    local body="SSS2-${sid}-${T}-${x}-${yh}" want
     want="$(printf '%s' "$body" | _sha256_hex)"; want="${want:0:4}"
-    [[ "$chk" == "$want" ]] || { err "combine: доля повреждена (контрольная сумма не сошлась): x=$x"; exit 1; }
-    (( x >= 1 && x <= 255 )) || { err "combine: недопустимый номер доли x=$x"; exit 1; }
-    local d; for d in "${XS[@]:-}"; do [[ "$d" == "$x" ]] && { err "combine: повторяющаяся доля x=$x"; exit 1; }; done
+    [[ "$chk" == "$want" ]] || { err "combine: доля повреждена (контрольная сумма не сошлась): x=$x"; return 1; }
+    (( x >= 1 && x <= 255 )) || { err "combine: недопустимый номер доли x=$x"; return 1; }
+    # set-id: все доли набора обязаны совпадать (детерминированный отказ при смешивании сплитов).
+    if [[ -z "$setid_seen" ]]; then setid_seen="$sid"
+    elif [[ "$sid" != "$setid_seen" ]]; then
+      err "combine: доли от РАЗНЫХ сплитов (set-id не совпал: $sid ≠ $setid_seen)"; return 1
+    fi
+    # declared-T: все доли обязаны заявлять одинаковый порог.
+    if [[ -z "$t_decl" ]]; then t_decl="$T"
+    elif [[ "$T" != "$t_decl" ]]; then
+      err "combine: доли заявляют разный порог T ($T ≠ $t_decl) — несовместимый набор"; return 1
+    fi
+    local d; for d in "${XS[@]:-}"; do [[ "$d" == "$x" ]] && { err "combine: повторяющаяся доля x=$x"; return 1; }; done
     [[ -z "$ylen" ]] && ylen="${#yh}"
-    [[ "${#yh}" -eq "$ylen" ]] || { err "combine: доли разной длины — набор несовместим"; exit 1; }
-    t_decl="$T"; XS+=("$x"); YS+=("$yh"); cnt=$((cnt+1))
+    [[ "${#yh}" -eq "$ylen" ]] || { err "combine: доли разной длины — несовместимый набор"; return 1; }
+    XS+=("$x"); YS+=("$yh"); cnt=$((cnt+1))
   done <<< "$raw"
 
-  (( cnt >= 1 )) || { err "combine: не подано ни одной доли"; exit 1; }
+  (( cnt >= 1 )) || { err "combine: не подано ни одной доли"; return 1; }
   if [[ -n "$t_decl" ]] && (( cnt < t_decl )); then
-    err "combine: нужно минимум $t_decl долей, подано $cnt"; exit 1
+    err "combine: ниже порога — нужно минимум $t_decl долей, подано $cnt"; return 1
   fi
 
   # Веса Лагранжа в нуле (одинаковы для всех байтов): w_i = prod_{j!=i} x_j * inv(x_i XOR x_j).
@@ -308,7 +335,7 @@ cmd_combine() {
     for ((j=0; j<m; j++)); do
       (( j == i )) && continue
       local xj="${XS[j]}"; local den=$(( xi ^ xj ))
-      (( den != 0 )) || { err "combine: совпадающие точки долей"; exit 1; }
+      (( den != 0 )) || { err "combine: совпадающие точки долей"; return 1; }
       num=${GF_EXP[$(( (GF_LOG[num]+GF_LOG[xj]) % 255 ))]}                 # num *= x_j
       num=${GF_EXP[$(( (GF_LOG[num]+(255-GF_LOG[den])%255) % 255 ))]}      # num *= inv(den)
     done
@@ -329,17 +356,34 @@ cmd_combine() {
     printf -v hb '%02x' "$acc"; payload_hex+="$hb"
   done
 
-  # Проверка обёртки: либо точный секрет, либо честный отказ.
-  local bad="combine: набор не образует валидный секрет (доли повреждены или от разных секретов)"
-  (( PL >= 6 )) || { err "$bad"; exit 1; }
-  (( 16#${payload_hex:0:2} == 0x55 )) || { err "$bad"; exit 1; }
+  # Проверка обёртки (16-байтный tag): magic(0x55) | len(2) | secret | tag(16).
+  local fail="combine: восстановление не прошло проверку целостности (повреждение долей или несовместимый набор)"
+  (( PL >= 20 )) || { err "$fail"; return 1; }          # 1 magic + 2 len + >=1 secret + 16 tag
+  (( 16#${payload_hex:0:2} == 0x55 )) || { err "$fail"; return 1; }
   local len=$(( 16#${payload_hex:2:4} ))
-  (( PL == len + 5 )) || { err "$bad"; exit 1; }
-  local core_hex="${payload_hex:0:$(( (len+3)*2 ))}" crc_have="${payload_hex: -4}" crc_want
-  crc_want="$(_from_hex "$core_hex" | _sha256_hex)"; crc_want="${crc_want:0:4}"
-  [[ "$crc_have" == "$crc_want" ]] || { err "$bad"; exit 1; }
+  (( PL == len + 19 )) || { err "$fail"; return 1; }     # 1 + 2 + len + 16
+  local core_hex="${payload_hex:0:$(( (len+3)*2 ))}" tag_have="${payload_hex: -32}" tag_want
+  tag_want="$(_from_hex "$core_hex" | _sha256_hex)"; tag_want="${tag_want:0:32}"
+  [[ "$tag_have" == "$tag_want" ]] || { err "$fail"; return 1; }
 
-  _from_hex "${payload_hex:6:$(( len*2 ))}"
+  printf '%s' "${payload_hex:6:$(( len*2 ))}"
+}
+
+cmd_combine() {
+  require_macos
+  local raw; if (( $# )); then raw="$(cat "$@")"; else raw="$(cat)"; fi
+  local sh; sh="$(_recover_secret_hex "$raw")" || exit 1
+  _from_hex "$sh"
+}
+
+# verify: проверить, что доли образуют валидный набор и секрет восстановим — БЕЗ его печати
+# (полезно при раскладке долей по носителям: подтвердить корректность, не раскрывая секрет).
+cmd_verify() {
+  require_macos
+  local raw; if (( $# )); then raw="$(cat "$@")"; else raw="$(cat)"; fi
+  local sh; sh="$(_recover_secret_hex "$raw")" || exit 1
+  local n=$(( ${#sh} / 2 ))
+  info "verify: доли согласованы, секрет восстановим (${n} байт). Секрет НЕ показан."
 }
 
 main() {
@@ -351,6 +395,7 @@ main() {
     help|--help|-h) usage ;;
     split)          cmd_split "$@" ;;
     combine)        cmd_combine "$@" ;;
+    verify)         cmd_verify "$@" ;;
     *) t unknown_cmd "$cmd" >&2; echo >&2; usage >&2; exit 1 ;;
   esac
 }
