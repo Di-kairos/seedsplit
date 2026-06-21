@@ -49,7 +49,7 @@ curl -fsSL https://github.com/Di-kairos/seedsplit/releases/latest/download/insta
 > corruption, partial/cached tampering, and stops you running code off the moving `main`
 > branch. It does **not** by itself defeat an attacker who can rewrite *both* the binary
 > and its checksum at the source (or your connection), nor does it prove *who* published
-> them. Pin a specific version with `SEEDSPLIT_VERSION=0.2.0` instead of `latest` for
+> them. Pin a specific version with `SEEDSPLIT_VERSION=0.3.0` instead of `latest` for
 > reproducibility. Override the source with `SEEDSPLIT_BASE_URL` and the install path
 > with `SEEDSPLIT_DEST`.
 
@@ -69,16 +69,18 @@ nothing):
 ```bash
 $ printf '%s' "legal winner thank year wave sausage worth useful legal winner thank yellow" \
     | seedsplit split -n 5 -t 3
-SSS1-3-1-b968a37b9e645e3f...0b5b5dd90947f1649d110f4ea74e177df8f44-8b1c
-SSS1-3-2-ceb46aba434ed581...9aaa9bcb-cbd9
-SSS1-3-3-22dc82adb84dead2...022c5a-8b11
-SSS1-3-4-03f88c162889179a...7b81075-ea44
-SSS1-3-5-ef906401d38a28c9...f10a7e4-1446
+SSS2-32c54257-3-1-86ef3410a5785b83…-316d
+SSS2-32c54257-3-2-4e0f3aca2ce3ca06…-9fca
+SSS2-32c54257-3-3-9de045b6ecfcf0e9…-62ec
+SSS2-32c54257-3-4-cd1ba35892aa7d32…-701d
+SSS2-32c54257-3-5-1ef4dc2452b547dd…-16e8
 ```
 
-Each line is a self-contained share in the form `SSS1-<T>-<x>-<hexY>-<chk4>`: format
-version, threshold, point index, body, and a 4-char checksum (catches a typo in that one
-share). Distribute the lines across different media/locations.
+Each line is a self-contained share in the form `SSS2-<setid>-<T>-<x>-<hexY>-<chk4>`:
+format version, a random **set-id** shared by all shares of one split (so `combine`
+deterministically refuses to mix shares from *different* splits), threshold, point index,
+body, and a 4-char checksum (catches a typo in that one share). Distribute the lines
+across different media/locations.
 
 Reconstruct the secret — feed **any T (or more) shares** on stdin, one per line:
 
@@ -91,6 +93,14 @@ You can also pass shares as file arguments:
 
 ```bash
 seedsplit combine share1.txt share2.txt share3.txt
+```
+
+Check that a set reconstructs **without revealing the secret** (useful when laying out
+shares across media — confirm correctness without exposing anything). It exits `0` and
+prints the recovered length, never the secret:
+
+```bash
+head -3 shares.txt | seedsplit verify
 ```
 
 Version and help:
@@ -106,6 +116,7 @@ seedsplit help           # or -h / --help
 |---|---|
 | `seedsplit split [-n N] [-t T] [--file F]` | Split a secret (from stdin or `--file`) into `N` shares; any `T` reconstruct it. Default `-n 3 -t 2`. |
 | `seedsplit combine [FILE...]` | Reconstruct the secret from ≥T shares (read from stdin, one per line, or from `FILE`s). |
+| `seedsplit verify [FILE...]` | Confirm ≥T shares reconstruct, **without printing the secret** (prints only the recovered length). |
 | `seedsplit version` | Print the version (also `-v` / `--version`). |
 | `seedsplit help` | Print help (also `-h` / `--help`). |
 
@@ -120,9 +131,14 @@ reducing polynomial `0x11b`, same as AES; addition = XOR, multiplication via log
 tables from generator `0x03`). The random polynomial coefficients come from
 `/dev/urandom`.
 
-The secret is wrapped in an integrity header (`0x55` | length | secret | CRC from
-sha256), so `combine` returns **either the exact secret or an honest refusal** —
-corrupted shares or a set from different secrets won't pass validation silently.
+The secret is wrapped in an integrity header (`0x55` | length | secret | **128-bit tag**
+from sha256), so `combine` returns **either the exact secret or an honest refusal** — the
+odds of silently returning a *wrong* secret are ≈ 2⁻¹²⁸. Each share also carries a random
+**set-id** (a 4-byte nonce, *not* derived from the secret — so it can't be used as a
+guess-confirmation oracle), letting `combine` deterministically reject a mix of shares
+from different splits. Failures are distinct and specific: corrupted share (checksum),
+shares from different splits (set-id), below threshold, inconsistent threshold, or a
+failed integrity check.
 
 ## Scope & limitations
 
@@ -137,13 +153,17 @@ oversell. So here are the honest limits:
   shares — geography and media are your responsibility;
 - **there is NO interoperability with SLIP-39 / hardware wallets yet** — a full SLIP-39
   (1024-word list + RS1024 + encryption) is a separate effort in scope, not "zero
-  dependencies"; it's honestly flagged as a scope decision for a later pack.
+  dependencies"; it's honestly flagged as a scope decision for a later pack;
+- **GF(256) multiplication uses log/antilog tables and is NOT constant-time** — there is a
+  timing side-channel. It is outside this tool's threat model (a local CLI with no remote
+  or online oracle on `split`/`combine`), but we don't hide it.
 
 ## Architecture
 
 - Single-file Bash, zero dependencies. Shamir over GF(256) is implemented in pure Bash;
-  the RNG is `/dev/urandom`. Tests: **bats** (31 tests — `split`/`combine`/round-trip,
-  threshold validation, honest refusal on corrupted and incompatible sets).
+  the RNG is `/dev/urandom`. Tests: **bats** (37 tests — `split`/`combine`/`verify`,
+  round-trip over every threshold subset, the full failure taxonomy, the 128-bit
+  integrity tag, plus known-answer tests: FIPS-197 GF vectors and a frozen share-set).
 - The shared core (`lib/common.sh`) is **vendored** inline from securetrash, pinned to a
   git ref; `tools/vendor-common.sh --check` catches drift in CI. See
   `paranoid-tools/README.md`.
