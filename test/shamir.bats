@@ -7,6 +7,7 @@ setup() {
   STUBS="${BATS_TEST_DIRNAME}/stubs"
   export PATH="$STUBS:$PATH"
   export ST_ASSUME_YES=1
+  export ST_LOCALE=en   # детерминируем локаль рантайм-сообщений (en — дефолт тула)
 }
 
 # --- помощник: разбить секрет, вернуть доли (по строке на долю) ---
@@ -65,7 +66,7 @@ _split() { # $1=secret $2=N $3=T
   sel="$(printf '%s\n' "$shares" | sed -n '1p;2p')"   # only 2 of 3
   run bash -c "printf '%s\n' \"$sel\" | bash '$SCRIPT' combine"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"ниже порога"* ]]
+  [[ "$output" == *"below threshold"* ]]
   [[ "$output" != *"needs-three"* ]]
 }
 
@@ -81,7 +82,7 @@ _split() { # $1=secret $2=N $3=T
   corrupt="SSS2-${sid}-${T}-${x}-${nc}${Y:1}-${chk}"
   run bash -c "printf '%s\n%s\n' '$corrupt' '$second' | bash '$SCRIPT' combine"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"повреждена"* ]]
+  [[ "$output" == *"corrupted"* ]]
   [[ "$output" != *"$secret"* ]]
 }
 
@@ -104,7 +105,7 @@ _split() { # $1=secret $2=N $3=T
   chk="$(printf '%s' "$body" | shasum -a 256 | cut -c1-4)"
   run bash -c "printf '%s\n%s\n' '$s1' '${body}-${chk}' | bash '$SCRIPT' combine"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"разный порог"* ]]
+  [[ "$output" == *"different threshold"* ]]
 }
 
 @test "16-byte payload tag catches corruption that passes per-share checksum" {
@@ -120,7 +121,7 @@ _split() { # $1=secret $2=N $3=T
   chk="$(printf '%s' "$body" | shasum -a 256 | cut -c1-4)"
   run bash -c "printf '%s\n%s\n' '${body}-${chk}' '$s2' | bash '$SCRIPT' combine"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"целостности"* ]]
+  [[ "$output" == *"integrity"* ]]
   [[ "$output" != *"$secret"* ]]
 }
 
@@ -129,14 +130,14 @@ _split() { # $1=secret $2=N $3=T
   one="$(printf '%s\n' "$shares" | sed -n '1p')"
   run bash -c "printf '%s\n%s\n' \"$one\" \"$one\" | bash '$SCRIPT' combine"
   [ "$status" -ne 0 ]
-  [[ "$output" == *"повторяющаяся"* ]]
+  [[ "$output" == *"duplicate"* ]]
 }
 
 @test "verify confirms a reconstructable set WITHOUT printing the secret" {
   secret="do-not-print-me"
   shares="$(_split "$secret" 3 2)"
   out="$(printf '%s\n' "$shares" | sed -n '1p;2p' | bash "$SCRIPT" verify)"
-  [[ "$out" == *"восстановим"* ]]
+  [[ "$out" == *"recoverable"* ]]
   [[ "$out" != *"$secret"* ]]
 }
 

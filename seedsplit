@@ -166,6 +166,55 @@ EOF
       ;;
     en:unknown_cmd) printf 'Unknown command: %s' "$1" ;;
     ru:unknown_cmd) printf 'Unknown command: %s' "$1" ;;
+
+    # --- split errors ---
+    en:split_bad_arg)       printf 'split: unknown argument: %s' "$1" ;;
+    ru:split_bad_arg)       printf 'split: неизвестный аргумент: %s' "$1" ;;
+    en:split_file_unreadable) printf 'split: file not readable: %s' "$1" ;;
+    ru:split_file_unreadable) printf 'split: файл недоступен: %s' "$1" ;;
+    en:split_empty_secret)  printf 'split: empty secret (feed it via stdin or --file)' ;;
+    ru:split_empty_secret)  printf 'split: пустой секрет (подай через stdin или --file)' ;;
+    en:split_nt_not_num)    printf 'split: -n/-t must be numbers' ;;
+    ru:split_nt_not_num)    printf 'split: -n/-t должны быть числами' ;;
+    en:split_t_min)         printf 'split: threshold -t must be >=2 (else a share equals the whole secret)' ;;
+    ru:split_t_min)         printf 'split: порог -t должен быть >=2 (иначе доля = весь секрет)' ;;
+    en:split_n_lt_t)        printf 'split: number of shares -n (%s) must be >= threshold -t (%s)' "$1" "$2" ;;
+    ru:split_n_lt_t)        printf 'split: число долей -n (%s) должно быть >= порога -t (%s)' "$1" "$2" ;;
+    en:split_n_max)         printf 'split: -n cannot exceed 255 (GF(256) evaluation points)' ;;
+    ru:split_n_max)         printf 'split: -n не может превышать 255 (точки оценки GF(256))' ;;
+    en:split_secret_big)    printf 'split: secret too large (>65535 bytes)' ;;
+    ru:split_secret_big)    printf 'split: секрет слишком большой (>65535 байт)' ;;
+    en:split_low_entropy)   printf 'split: not enough entropy from /dev/urandom' ;;
+    ru:split_low_entropy)   printf 'split: мало энтропии из /dev/urandom' ;;
+
+    # --- combine errors (taxonomy) ---
+    en:combine_not_sss2)    printf 'combine: line does not look like an SSS2 share: %s' "$1" ;;
+    ru:combine_not_sss2)    printf 'combine: строка не похожа на долю формата SSS2: %s' "$1" ;;
+    en:combine_corrupt)     printf 'combine: share corrupted (checksum mismatch): x=%s' "$1" ;;
+    ru:combine_corrupt)     printf 'combine: доля повреждена (контрольная сумма не сошлась): x=%s' "$1" ;;
+    en:combine_bad_x)       printf 'combine: invalid share index x=%s' "$1" ;;
+    ru:combine_bad_x)       printf 'combine: недопустимый номер доли x=%s' "$1" ;;
+    en:combine_diff_splits) printf 'combine: shares from DIFFERENT splits (set-id mismatch: %s != %s)' "$1" "$2" ;;
+    ru:combine_diff_splits) printf 'combine: доли от РАЗНЫХ сплитов (set-id не совпал: %s != %s)' "$1" "$2" ;;
+    en:combine_diff_t)      printf 'combine: shares declare a different threshold T (%s != %s) — incompatible set' "$1" "$2" ;;
+    ru:combine_diff_t)      printf 'combine: доли заявляют разный порог T (%s != %s) — несовместимый набор' "$1" "$2" ;;
+    en:combine_dup)         printf 'combine: duplicate share x=%s' "$1" ;;
+    ru:combine_dup)         printf 'combine: повторяющаяся доля x=%s' "$1" ;;
+    en:combine_diff_len)    printf 'combine: shares of different length — incompatible set' ;;
+    ru:combine_diff_len)    printf 'combine: доли разной длины — несовместимый набор' ;;
+    en:combine_no_shares)   printf 'combine: no shares provided' ;;
+    ru:combine_no_shares)   printf 'combine: не подано ни одной доли' ;;
+    en:combine_below)       printf 'combine: below threshold — need at least %s shares, got %s' "$1" "$2" ;;
+    ru:combine_below)       printf 'combine: ниже порога — нужно минимум %s долей, подано %s' "$1" "$2" ;;
+    en:combine_coincident)  printf 'combine: coincident share points' ;;
+    ru:combine_coincident)  printf 'combine: совпадающие точки долей' ;;
+    en:combine_integrity)   printf 'combine: reconstruction failed the integrity check (corrupted shares or incompatible set)' ;;
+    ru:combine_integrity)   printf 'combine: восстановление не прошло проверку целостности (повреждение долей или несовместимый набор)' ;;
+
+    # --- verify ---
+    en:verify_ok)           printf 'verify: shares are consistent, the secret is recoverable (%s bytes). The secret is NOT shown.' "$1" ;;
+    ru:verify_ok)           printf 'verify: доли согласованы, секрет восстановим (%s байт). Секрет НЕ показан.' "$1" ;;
+
     *) echo "$key" ;;
   esac
 }
@@ -212,27 +261,27 @@ cmd_split() {
       -n|--shares)    n="${2:?}"; shift 2 ;;
       -t|--threshold) t="${2:?}"; shift 2 ;;
       --file)         file="${2:?}"; shift 2 ;;
-      *) err "split: неизвестный аргумент: $1"; exit 1 ;;
+      *) err "$(t split_bad_arg "$1")"; exit 1 ;;
     esac
   done
 
   # Секрет — из stdin или --file, в hex. Никогда из argv (виден в `ps`).
   local secret_hex
   if [[ -n "$file" ]]; then
-    [[ -r "$file" ]] || { err "split: файл недоступен: $file"; exit 1; }
+    [[ -r "$file" ]] || { err "$(t split_file_unreadable "$file")"; exit 1; }
     secret_hex="$(_to_hex < "$file")"
   else
     secret_hex="$(_to_hex)"
   fi
-  [[ -n "$secret_hex" ]] || { err "split: пустой секрет (подай через stdin или --file)"; exit 1; }
+  [[ -n "$secret_hex" ]] || { err "$(t split_empty_secret)"; exit 1; }
 
-  [[ "$n" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ ]] || { err "split: -n/-t должны быть числами"; exit 1; }
-  (( t >= 2 )) || { err "split: порог -t должен быть ≥2 (иначе доля = весь секрет)"; exit 1; }
-  (( n >= t )) || { err "split: число долей -n ($n) должно быть ≥ порога -t ($t)"; exit 1; }
-  (( n <= 255 )) || { err "split: -n не может превышать 255 (точки оценки GF(256))"; exit 1; }
+  [[ "$n" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ ]] || { err "$(t split_nt_not_num)"; exit 1; }
+  (( t >= 2 )) || { err "$(t split_t_min)"; exit 1; }
+  (( n >= t )) || { err "$(t split_n_lt_t "$n" "$t")"; exit 1; }
+  (( n <= 255 )) || { err "$(t split_n_max)"; exit 1; }
 
   local L=$(( ${#secret_hex} / 2 ))
-  (( L <= 65535 )) || { err "split: секрет слишком большой (>65535 байт)"; exit 1; }
+  (( L <= 65535 )) || { err "$(t split_secret_big)"; exit 1; }
 
   # Случайный set-id (4-байтный nonce) — НЕ производный от секрета (иначе confirmation-оракул:
   # имея одну долю + кандидат-секрет, можно было бы проверить догадку, не собирая порог).
@@ -240,7 +289,7 @@ cmd_split() {
   # из разных сплитов (а не вероятностно).
   local setid_hex
   setid_hex="$(head -c 4 /dev/urandom | _to_hex)"
-  [[ ${#setid_hex} -eq 8 ]] || { err "split: мало энтропии из /dev/urandom"; exit 1; }
+  [[ ${#setid_hex} -eq 8 ]] || { err "$(t split_low_entropy)"; exit 1; }
 
   # Обёртка целостности: 0x55 | len(2B BE) | secret | tag(16B = первые 16 байт sha256 предыдущего).
   # 128-битный tag: combine вернёт ЛИБО точный секрет, ЛИБО честный отказ; шанс молча отдать
@@ -259,7 +308,7 @@ cmd_split() {
   # (t-1) случайных байт на каждый байт payload — старшие коэффициенты многочленов.
   local need=$(( (t-1) * PL )) rand_hex
   rand_hex="$(head -c "$need" /dev/urandom | _to_hex)"
-  [[ ${#rand_hex} -eq $((need*2)) ]] || { err "split: мало энтропии из /dev/urandom"; exit 1; }
+  [[ ${#rand_hex} -eq $((need*2)) ]] || { err "$(t split_low_entropy)"; exit 1; }
 
   local -a Y=(); local x j ri=0 y hb
   for ((x=1; x<=n; x++)); do Y[x]=""; done
@@ -299,32 +348,32 @@ _recover_secret_hex() {
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     if [[ ! "$line" =~ ^SSS2-([0-9a-f]{8})-([0-9]+)-([0-9]+)-([0-9a-f]+)-([0-9a-f]{4})$ ]]; then
-      err "combine: строка не похожа на долю формата SSS2: $line"; return 1
+      err "$(t combine_not_sss2 "$line")"; return 1
     fi
     local sid="${BASH_REMATCH[1]}" T="${BASH_REMATCH[2]}" x="${BASH_REMATCH[3]}" yh="${BASH_REMATCH[4]}" chk="${BASH_REMATCH[5]}"
     local body="SSS2-${sid}-${T}-${x}-${yh}" want
     want="$(printf '%s' "$body" | _sha256_hex)"; want="${want:0:4}"
-    [[ "$chk" == "$want" ]] || { err "combine: доля повреждена (контрольная сумма не сошлась): x=$x"; return 1; }
-    (( x >= 1 && x <= 255 )) || { err "combine: недопустимый номер доли x=$x"; return 1; }
+    [[ "$chk" == "$want" ]] || { err "$(t combine_corrupt "$x")"; return 1; }
+    (( x >= 1 && x <= 255 )) || { err "$(t combine_bad_x "$x")"; return 1; }
     # set-id: все доли набора обязаны совпадать (детерминированный отказ при смешивании сплитов).
     if [[ -z "$setid_seen" ]]; then setid_seen="$sid"
     elif [[ "$sid" != "$setid_seen" ]]; then
-      err "combine: доли от РАЗНЫХ сплитов (set-id не совпал: $sid ≠ $setid_seen)"; return 1
+      err "$(t combine_diff_splits "$sid" "$setid_seen")"; return 1
     fi
     # declared-T: все доли обязаны заявлять одинаковый порог.
     if [[ -z "$t_decl" ]]; then t_decl="$T"
     elif [[ "$T" != "$t_decl" ]]; then
-      err "combine: доли заявляют разный порог T ($T ≠ $t_decl) — несовместимый набор"; return 1
+      err "$(t combine_diff_t "$T" "$t_decl")"; return 1
     fi
-    local d; for d in "${XS[@]:-}"; do [[ "$d" == "$x" ]] && { err "combine: повторяющаяся доля x=$x"; return 1; }; done
+    local d; for d in "${XS[@]:-}"; do [[ "$d" == "$x" ]] && { err "$(t combine_dup "$x")"; return 1; }; done
     [[ -z "$ylen" ]] && ylen="${#yh}"
-    [[ "${#yh}" -eq "$ylen" ]] || { err "combine: доли разной длины — несовместимый набор"; return 1; }
+    [[ "${#yh}" -eq "$ylen" ]] || { err "$(t combine_diff_len)"; return 1; }
     XS+=("$x"); YS+=("$yh"); cnt=$((cnt+1))
   done <<< "$raw"
 
-  (( cnt >= 1 )) || { err "combine: не подано ни одной доли"; return 1; }
+  (( cnt >= 1 )) || { err "$(t combine_no_shares)"; return 1; }
   if [[ -n "$t_decl" ]] && (( cnt < t_decl )); then
-    err "combine: ниже порога — нужно минимум $t_decl долей, подано $cnt"; return 1
+    err "$(t combine_below "$t_decl" "$cnt")"; return 1
   fi
 
   # Веса Лагранжа в нуле (одинаковы для всех байтов): w_i = prod_{j!=i} x_j * inv(x_i XOR x_j).
@@ -335,7 +384,7 @@ _recover_secret_hex() {
     for ((j=0; j<m; j++)); do
       (( j == i )) && continue
       local xj="${XS[j]}"; local den=$(( xi ^ xj ))
-      (( den != 0 )) || { err "combine: совпадающие точки долей"; return 1; }
+      (( den != 0 )) || { err "$(t combine_coincident)"; return 1; }
       num=${GF_EXP[$(( (GF_LOG[num]+GF_LOG[xj]) % 255 ))]}                 # num *= x_j
       num=${GF_EXP[$(( (GF_LOG[num]+(255-GF_LOG[den])%255) % 255 ))]}      # num *= inv(den)
     done
@@ -357,7 +406,7 @@ _recover_secret_hex() {
   done
 
   # Проверка обёртки (16-байтный tag): magic(0x55) | len(2) | secret | tag(16).
-  local fail="combine: восстановление не прошло проверку целостности (повреждение долей или несовместимый набор)"
+  local fail; fail="$(t combine_integrity)"
   (( PL >= 20 )) || { err "$fail"; return 1; }          # 1 magic + 2 len + >=1 secret + 16 tag
   (( 16#${payload_hex:0:2} == 0x55 )) || { err "$fail"; return 1; }
   local len=$(( 16#${payload_hex:2:4} ))
@@ -383,7 +432,7 @@ cmd_verify() {
   local raw; if (( $# )); then raw="$(cat "$@")"; else raw="$(cat)"; fi
   local sh; sh="$(_recover_secret_hex "$raw")" || exit 1
   local n=$(( ${#sh} / 2 ))
-  info "verify: доли согласованы, секрет восстановим (${n} байт). Секрет НЕ показан."
+  info "$(t verify_ok "$n")"
 }
 
 main() {
