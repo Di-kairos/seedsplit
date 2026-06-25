@@ -7,6 +7,7 @@ Split a secret across shares with Shamir Secret Sharing — no "unbreakable" sna
 [![CI](https://github.com/Di-kairos/seedsplit/actions/workflows/ci.yml/badge.svg)](https://github.com/Di-kairos/seedsplit/actions/workflows/ci.yml)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![platform](https://img.shields.io/badge/platform-macOS-blue)
+![windows](https://img.shields.io/badge/Windows-beta-orange)
 ![shellcheck](https://img.shields.io/badge/shellcheck-passing-brightgreen)
 
 Part of the [Paranoid Tools](https://github.com/Di-kairos/paranoid-tools) ecosystem.
@@ -179,10 +180,14 @@ oversell. So here are the honest limits:
   git ref; `tools/vendor-common.sh --check` catches drift in CI. See
   `paranoid-tools/README.md`.
 
-## Windows equivalent
+## Windows (beta)
 
-Planned second: the same Shamir over GF(256) in PowerShell, with
-`RNGCryptoServiceProvider` instead of `/dev/urandom`. The port follows securetrash.
+A PowerShell port now exists in [`windows/README.md`](windows/README.md). It mirrors the
+macOS logic — the same Shamir over GF(256), with `RNGCryptoServiceProvider` instead of
+`/dev/urandom` — and produces **byte-compatible** shares (split on one OS, combine on the other).
+
+> **Beta:** the Windows port is logic-tested (Pester on CI) but not yet validated on real
+> Windows hardware. See [`windows/README.md`](windows/README.md).
 
 ## License
 
