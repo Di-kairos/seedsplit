@@ -169,6 +169,14 @@ oversell. So here are the honest limits:
 - **GF(256) multiplication uses log/antilog tables and is NOT constant-time** — there is a
   timing side-channel. It is outside this tool's threat model (a local CLI with no remote
   or online oracle on `split`/`combine`), but we don't hide it.
+- **the passphrase layer (`-p`) uses openssl**, not the zero-dep core — it's an opt-in
+  encrypt-before-split (AES-256-CBC + PBKDF2) so a reconstructed threshold still needs the
+  passphrase. The core `split`/`combine` stay dependency-free; only `-p` calls openssl
+  (present by default on macOS/Linux). The Windows port reconstructs the sealed container and
+  tells you to decrypt it with an `openssl enc -d` pipeline. **Edge:** a non-encrypted secret
+  that happens to begin with the literal bytes `Salted__` (≈2⁻⁶⁴ for arbitrary data; not a
+  concern for real seed phrases) is mis-read by `combine` as encrypted — you'd get a
+  "wrong passphrase" error instead of the secret (no leak); re-split with `-p` or decrypt by hand.
 
 ## Architecture
 

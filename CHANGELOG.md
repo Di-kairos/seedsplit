@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-28
+
+### Added
+- **Passphrase layer (`split -p` / `--passphrase`).** Optionally encrypts the secret with
+  native **openssl** (AES-256-CBC + PBKDF2, 200k iters) BEFORE Shamir-splitting, so a
+  reconstructed threshold of shares still yields only a sealed `openssl enc` container — the
+  secret stays protected by the passphrase. `combine` auto-detects the container and prompts
+  for the passphrase (env `SEEDSPLIT_PASSPHRASE` for automation/tests; otherwise `/dev/tty`).
+  The Shamir core is untouched and stays zero-dependency — only `-p` uses openssl (present by
+  default on macOS/Linux). Passphrase is passed to openssl via fd, never argv (`ps`-safe).
+  Windows port: `combine` honestly flags a sealed container and emits it for an `openssl enc -d`
+  pipeline (no hard openssl dependency in the PowerShell port).
+
+### Notes (deliberately NOT shipped — honesty over snake oil)
+- **SLIP-39** is not reimplemented: rolling a crypto standard (GF(256) + RS1024 + wordlist) in
+  bash is exactly the kind of unaudited crypto this project refuses to ship. Use a vetted
+  SLIP-39 tool for hardware-wallet interop.
+- **Decoy / hidden vault** is not added: real plausible deniability needs hidden volumes
+  (VeraCrypt-style), which APFS does not support natively; a second visible vault gives ZERO
+  deniability (forensics sees both), so shipping it would be snake oil.
+
 ## [0.3.3] — 2026-06-26
 
 ### Changed

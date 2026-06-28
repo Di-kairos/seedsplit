@@ -17,7 +17,7 @@
 # Вывод данных (доли, секрет, версия) идёт в stdout через Write-Output / raw-stream — чтобы
 # `seedsplit split > shares.txt` и пайпы работали (Write-Host в PS 5.1 не попадает в stdout).
 
-$VERSION = '0.3.3'
+$VERSION = '0.4.0'
 
 # --- locale: en по умолчанию; ru — если ST_LANG или системная UI-локаль начинаются с 'ru' ---
 function Get-SsLocale {
@@ -88,6 +88,8 @@ function T {
         'ru:combine_integrity'    { return 'combine: восстановление не прошло проверку целостности (повреждение долей или несовместимый набор)' }
         'en:verify_ok'            { return "verify: shares are consistent, the secret is recoverable ($A bytes). The secret is NOT shown." }
         'ru:verify_ok'            { return "verify: доли согласованы, секрет восстановим ($A байт). Секрет НЕ показан." }
+        'en:pp_sealed_win'        { return 'These shares are passphrase-encrypted (openssl AES-256-CBC/PBKDF2, created with -p). The bytes below are the SEALED container, NOT the secret — decrypt them: ... | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000' }
+        'ru:pp_sealed_win'        { return 'Доли зашифрованы passphrase (openssl AES-256-CBC/PBKDF2, сделаны с -p). Байты ниже — ЗАПЕЧАТАННЫЙ контейнер, НЕ секрет — расшифруй: ... | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000' }
         default                   { return $Key }
     }
 }
@@ -404,6 +406,14 @@ function Invoke-SsCombine {
     param([string[]]$ArgList)
     $raw = Read-SsCombineInput $ArgList
     $secret = Get-SsRecoveredSecret $raw
+    # Контейнер passphrase-режима (-p, macOS/Linux): первые 8 байт = "Salted__" (openssl). На
+    # Windows авто-расшифровку не делаем (без жёсткой зависимости от openssl) — честно
+    # предупреждаем и отдаём контейнер как есть, чтобы расшифровать его openssl-конвейером.
+    if ($secret.Length -ge 8 -and
+        $secret[0] -eq 0x53 -and $secret[1] -eq 0x61 -and $secret[2] -eq 0x6C -and $secret[3] -eq 0x74 -and
+        $secret[4] -eq 0x65 -and $secret[5] -eq 0x64 -and $secret[6] -eq 0x5F -and $secret[7] -eq 0x5F) {
+        Write-SsWarn (T 'pp_sealed_win')
+    }
     Write-SsStdoutBytes $secret
 }
 

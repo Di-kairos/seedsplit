@@ -15,7 +15,7 @@
 # Ядро split/combine над GF(256) реализовано (pack 2). См. README «Scope & limitations».
 set -euo pipefail
 
-VERSION="0.3.3"
+VERSION="0.4.0"
 
 # === BEGIN vendored common (pin: 2e3d2dd5b36251bdcb1a8ffd348b63ece5fa7aab) ===
 # shellcheck shell=bash
@@ -135,14 +135,20 @@ t() {
 Usage: seedsplit <command> [args]
 
 Commands:
-  split [-n N] [-t T] [--file F]   Split a secret (from stdin or --file) into N
+  split [-n N] [-t T] [-p] [--file F]
+                                   Split a secret (from stdin or --file) into N
                                    shares; any T reconstruct it. Default: -n 3 -t 2.
-  combine [FILE...]                Reconstruct the secret from >=T shares
-                                   (read from stdin, one per line, or from FILEs).
+                                   -p/--passphrase: encrypt the secret first, so a
+                                   reconstructed threshold still needs the passphrase.
+  combine [FILE...]                Reconstruct the secret from >=T shares (stdin, one
+                                   per line, or FILEs). Prompts for the passphrase if
+                                   the shares were split with -p.
   verify  [FILE...]                Check that >=T shares reconstruct WITHOUT printing the secret.
   version                          Show the version
 
 Secret is read from stdin/--file, NEVER argv (argv is visible in `ps`).
+-p uses openssl (AES-256-CBC + PBKDF2), present by default on macOS/Linux — the core
+split/combine stay zero-dependency; only -p needs openssl.
 seedsplit does NOT yet interoperate with SLIP-39 / hardware wallets — that is a
 scope decision for a later pack. Shares are only as safe as where you store them.
 EOF
@@ -152,14 +158,19 @@ EOF
 Usage: seedsplit <command> [args]
 
 Commands:
-  split [-n N] [-t T] [--file F]   Разбить секрет (из stdin или --file) на N долей;
+  split [-n N] [-t T] [-p] [--file F]
+                                   Разбить секрет (из stdin или --file) на N долей;
                                    любые T восстанавливают его. По умолчанию: -n 3 -t 2.
-  combine [FILE...]                Восстановить секрет из >=T долей
-                                   (читает из stdin по строке на долю, либо из FILE).
+                                   -p/--passphrase: сначала зашифровать секрет, чтобы
+                                   собранный порог всё равно требовал passphrase.
+  combine [FILE...]                Восстановить секрет из >=T долей (stdin по строке,
+                                   либо FILE). Спросит passphrase, если доли сделаны с -p.
   verify  [FILE...]                Проверить восстановимость из >=T долей БЕЗ печати секрета.
   version                          Показать версию
 
 Секрет читается из stdin/--file, НИКОГДА из argv (argv виден в `ps`).
+-p использует openssl (AES-256-CBC + PBKDF2), есть по умолчанию на macOS/Linux — ядро
+split/combine остаётся zero-dependency; openssl нужен только для -p.
 seedsplit ПОКА не совместим со SLIP-39 / аппаратными кошельками — это решение по
 объёму на будущий пак. Доли безопасны ровно настолько, насколько безопасно ты их хранишь.
 EOF
@@ -215,6 +226,27 @@ EOF
     en:verify_ok)           printf 'verify: shares are consistent, the secret is recoverable (%s bytes). The secret is NOT shown.' "$1" ;;
     ru:verify_ok)           printf 'verify: доли согласованы, секрет восстановим (%s байт). Секрет НЕ показан.' "$1" ;;
 
+    # --- passphrase layer (opt-in: encrypts the secret with openssl AES-256/PBKDF2 BEFORE
+    #     splitting, so a reconstructed threshold still needs the passphrase) ---
+    en:pp_no_openssl)       printf 'passphrase mode needs openssl (not found on PATH). Core split/combine stay zero-dep; only --passphrase uses it.' ;;
+    ru:pp_no_openssl)       printf 'режим passphrase требует openssl (нет в PATH). Ядро split/combine остаётся zero-dep; openssl нужен только для --passphrase.' ;;
+    en:pp_set)              printf 'Passphrase (encrypts the secret before splitting): ' ;;
+    ru:pp_set)              printf 'Passphrase (шифрует секрет перед разбиением): ' ;;
+    en:pp_confirm)          printf 'Confirm passphrase: ' ;;
+    ru:pp_confirm)          printf 'Повтори passphrase: ' ;;
+    en:pp_mismatch)         printf 'split: passphrases do not match.' ;;
+    ru:pp_mismatch)         printf 'split: passphrase не совпадают.' ;;
+    en:pp_empty)            printf 'split: empty passphrase (omit --passphrase if you do not want one).' ;;
+    ru:pp_empty)            printf 'split: пустой passphrase (убери --passphrase, если он не нужен).' ;;
+    en:pp_enc_fail)         printf 'split: openssl encryption failed.' ;;
+    ru:pp_enc_fail)         printf 'split: ошибка шифрования openssl.' ;;
+    en:pp_locked)           printf 'These shares are passphrase-protected — enter the passphrase to reveal the secret: ' ;;
+    ru:pp_locked)           printf 'Доли защищены passphrase — введи его, чтобы раскрыть секрет: ' ;;
+    en:pp_dec_fail)         printf 'combine: wrong passphrase, or the encrypted secret is corrupt.' ;;
+    ru:pp_dec_fail)         printf 'combine: неверный passphrase или зашифрованный секрет повреждён.' ;;
+    en:pp_locked_noss)      printf 'combine: these shares are passphrase-encrypted but openssl is not on PATH. Decrypt elsewhere: the reconstructed bytes are a standard openssl enc -aes-256-cbc -pbkdf2 container.' ;;
+    ru:pp_locked_noss)      printf 'combine: доли зашифрованы passphrase, но openssl нет в PATH. Расшифруй в другом месте: восстановленные байты — стандартный контейнер openssl enc -aes-256-cbc -pbkdf2.' ;;
+
     *) echo "$key" ;;
   esac
 }
@@ -253,14 +285,51 @@ _gf_init() {
   done
 }
 
+# === passphrase-слой (opt-in) ===
+# Шифрует секрет ДО разбиения через native openssl (AES-256-CBC + PBKDF2). Так восстановленный
+# порог долей даёт лишь стандартный `Salted__`-контейнер — секрет всё ещё под passphrase.
+# Ядро split/combine не трогаем (режет/собирает любые байты). openssl нужен ТОЛЬКО для этого
+# режима — zero-dep ядра сохранён. Параметры фиксированы → расшифровка совместима везде, где есть openssl.
+PP_ITER=200000
+
+# Прочитать passphrase для шифрования (с подтверждением). Env SEEDSPLIT_PASSPHRASE — для тестов/
+# автоматизации; иначе скрытый ввод с /dev/tty (stdin занят секретом в pipe). Печатает passphrase в stdout.
+_pp_read_set() {
+  if [[ -n "${SEEDSPLIT_PASSPHRASE:-}" ]]; then printf '%s' "$SEEDSPLIT_PASSPHRASE"; return 0; fi
+  local p1 p2
+  printf '%s' "$(t pp_set)" >/dev/tty; read -rs p1 </dev/tty; echo >/dev/tty
+  printf '%s' "$(t pp_confirm)" >/dev/tty; read -rs p2 </dev/tty; echo >/dev/tty
+  [[ -n "$p1" ]] || { p1=""; p2=""; err "$(t pp_empty)"; return 1; }
+  [[ "$p1" == "$p2" ]] || { p1=""; p2=""; err "$(t pp_mismatch)"; return 1; }
+  p2=""
+  printf '%s' "$p1"
+}
+
+# Прочитать passphrase для расшифровки (один ввод). Env-override как у _pp_read_set.
+_pp_read_unlock() {
+  if [[ -n "${SEEDSPLIT_PASSPHRASE:-}" ]]; then printf '%s' "$SEEDSPLIT_PASSPHRASE"; return 0; fi
+  local p
+  printf '%s' "$(t pp_locked)" >/dev/tty; read -rs p </dev/tty; echo >/dev/tty
+  printf '%s' "$p"
+}
+
+# Зашифровать secret_hex passphrase'ом → ct_hex. Passphrase через fd:3 (НЕ argv → не виден в `ps`).
+_pp_encrypt_hex() {
+  local sec_hex="$1" pp="$2" ct_hex
+  ct_hex="$(_from_hex "$sec_hex" | openssl enc -aes-256-cbc -pbkdf2 -iter "$PP_ITER" -salt -pass fd:3 3<<<"$pp" 2>/dev/null | _to_hex)" || return 1
+  [[ -n "$ct_hex" ]] || return 1
+  printf '%s' "$ct_hex"
+}
+
 cmd_split() {
   require_macos
-  local n=3 t=2 file=""
+  local n=3 t=2 file="" use_pp=0
   while (( $# )); do
     case "$1" in
-      -n|--shares)    n="${2:?}"; shift 2 ;;
-      -t|--threshold) t="${2:?}"; shift 2 ;;
-      --file)         file="${2:?}"; shift 2 ;;
+      -n|--shares)        n="${2:?}"; shift 2 ;;
+      -t|--threshold)     t="${2:?}"; shift 2 ;;
+      --file)             file="${2:?}"; shift 2 ;;
+      -p|--passphrase)    use_pp=1; shift ;;
       *) err "$(t split_bad_arg "$1")"; exit 1 ;;
     esac
   done
@@ -274,6 +343,14 @@ cmd_split() {
     secret_hex="$(_to_hex)"
   fi
   [[ -n "$secret_hex" ]] || { err "$(t split_empty_secret)"; exit 1; }
+
+  # Passphrase-слой (opt-in): шифруем секрет ДО разбиения. Доли = Shamir поверх шифртекста.
+  if (( use_pp )); then
+    command -v openssl >/dev/null 2>&1 || { err "$(t pp_no_openssl)"; exit 1; }
+    local pp; pp="$(_pp_read_set)" || exit 1
+    secret_hex="$(_pp_encrypt_hex "$secret_hex" "$pp")" || { pp=""; err "$(t pp_enc_fail)"; exit 1; }
+    pp=""   # вычистить из памяти
+  fi
 
   [[ "$n" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ ]] || { err "$(t split_nt_not_num)"; exit 1; }
   (( t >= 2 )) || { err "$(t split_t_min)"; exit 1; }
@@ -422,7 +499,20 @@ cmd_combine() {
   require_macos
   local raw; if (( $# )); then raw="$(cat "$@")"; else raw="$(cat)"; fi
   local sh; sh="$(_recover_secret_hex "$raw")" || exit 1
-  _from_hex "$sh"
+  # Восстановленный секрет — openssl-контейнер (magic "Salted__" = hex 53616c7465645f5f)?
+  # Значит он зашифрован passphrase'ом: спрашиваем и расшифровываем (неверный → честный отказ).
+  # Edge (документирован в README): если НЕ-зашифрованный секрет (split без -p) сам начинается
+  # ровно с байтов "Salted__" (для произвольных данных ~2^-64, для текстовых секретов — нет),
+  # combine ошибочно попросит passphrase. Это не утечка — просто отдаст «wrong passphrase»
+  # вместо секрета; обойти — пере-split с -p или расшифровать вручную через openssl.
+  if [[ "${sh:0:16}" == "53616c7465645f5f" ]]; then
+    command -v openssl >/dev/null 2>&1 || { err "$(t pp_locked_noss)"; exit 1; }
+    local pp; pp="$(_pp_read_unlock)"
+    _from_hex "$sh" | openssl enc -d -aes-256-cbc -pbkdf2 -iter "$PP_ITER" -pass fd:3 3<<<"$pp" 2>/dev/null || { pp=""; err "$(t pp_dec_fail)"; exit 1; }
+    pp=""
+  else
+    _from_hex "$sh"
+  fi
 }
 
 # verify: проверить, что доли образуют валидный набор и секрет восстановим — БЕЗ его печати
